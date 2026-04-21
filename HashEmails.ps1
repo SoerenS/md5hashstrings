@@ -1,73 +1,64 @@
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory=$true, HelpMessage="Filename or path to the source email list.")]
-    [string]$InputFile,
-
-    [Parameter(Mandatory=$true, HelpMessage="Filename or path where the hashes will be saved.")]
-    [string]$OutputFile,
-
-    [Parameter(Mandatory=$true, HelpMessage="The secret salt/key to append to the emails.")]
-    [string]$SaltKey
+    [Parameter(Mandatory=$true)] [string]$InputFile,
+    [Parameter(Mandatory=$true)] [string]$OutputFile,
+    [Parameter(Mandatory=$true)] [string]$SaltKey,
+    [Parameter(Mandatory=$false)] [string]$Delimiter = ";" 
 )
 
 process {
-    # Resolve paths relative to the script location
     $fullInputPath = if ([System.IO.Path]::IsPathRooted($InputFile)) { $InputFile } else { Join-Path $PSScriptRoot $InputFile }
     $fullOutputPath = if ([System.IO.Path]::IsPathRooted($OutputFile)) { $OutputFile } else { Join-Path $PSScriptRoot $OutputFile }
 
     if (Test-Path $fullInputPath) {
-        Write-Host "Reading: $fullInputPath" -ForegroundColor Cyan
+        Write-Host "Cleaning and Loading CSV..." -ForegroundColor Cyan
         
-        # 1. Count lines for progress bar
-        Write-Host "Analyzing file size..." -ForegroundColor Gray
-        $totalLines = [System.IO.File]::ReadAllLines($fullInputPath).Length
-        $currentLine = 0
+        # 1. PRE-FILTER: Read raw lines and only keep those containing the delimiter
+        # This skips empty lines or lines that would break the CSV structure.
+        $rawContent = Get-Content $fullInputPath
+        $filteredContent = $rawContent | Where-Object { $_ -like "*$Delimiter*" }
+        
+        if ($filteredContent.Count -lt 2) {
+            Write-Error "No valid data rows found with delimiter '$Delimiter'."
+            return
+        }
 
-        # 2. Initialize Crypto and IO
+        # 2. CONVERT: Turn the filtered text into CSV objects
+        $data = $filteredContent | ConvertFrom-Csv -Delimiter $Delimiter
+        $totalRows = $data.Count
+        $currentRow = 0
+        
         $md5 = [System.Security.Cryptography.MD5]::Create()
         $utf8 = [System.Text.Encoding]::UTF8
-        
-        # Open a stream for writing (Efficient for large files)
-        $writer = New-Object System.IO.StreamWriter($fullOutputPath)
+        $emailRegex = "(?i)^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$"
 
-        Write-Host "Hashing emails..." -ForegroundColor Cyan
+        Write-Host "Anonymizing $totalRows valid rows..." -ForegroundColor Cyan
 
-        # 3. Process
-        foreach ($line in [System.IO.File]::ReadLines($fullInputPath)) {
-            $currentLine++
-            
-            # Update progress bar every 500 lines for maximum speed
-            if ($currentLine % 500 -eq 0 -or $currentLine -eq $totalLines) {
-                $percent = ($currentLine / $totalLines) * 100
-                Write-Progress -Activity "Hashing Emails" `
-                               -Status "Processing line $currentLine of $totalLines" `
-                               -PercentComplete $percent
+        # 3. PROCESS
+        foreach ($row in $data) {
+            $currentRow++
+            if ($currentRow % 100 -eq 0 -or $currentRow -eq $totalRows) {
+                Write-Progress -Activity "Hashing Emails" -Status "Row $currentRow of $totalRows" -PercentComplete (($currentRow/$totalRows)*100)
             }
 
-            $email = $line.Trim()
-            if ($email -ne "") {
-                # Combine and hash
-                $combinedString = $email + $SaltKey
-                $bytes = $utf8.GetBytes($combinedString)
-                $hashBytes = $md5.ComputeHash($bytes)
-                
-                # Convert to hex
-                $hashString = [System.BitConverter]::ToString($hashBytes).Replace("-", "").ToLower()
-                
-                # Write to the file on a new line
-                $writer.WriteLine($hashString)
+            foreach ($property in $row.PSObject.Properties) {
+                $val = $property.Value
+                if ($null -ne $val -and $val.Trim() -match $emailRegex) {
+                    $normalized = $val.Trim().ToLower()
+                    $combined = $normalized + $SaltKey
+                    $hashBytes = $md5.ComputeHash($utf8.GetBytes($combined))
+                    $property.Value = [System.BitConverter]::ToString($hashBytes).Replace("-", "").ToLower()
+                }
             }
         }
-        
-        # 4. Cleanup
-        $writer.Close()
-        $writer.Dispose()
+
+        # 4. EXPORT
+        Write-Host "Exporting to: $fullOutputPath" -ForegroundColor Gray
+        $data | Export-Csv -Path $fullOutputPath -NoTypeInformation -Encoding UTF8 -Delimiter $Delimiter
+
         $md5.Dispose()
-        
-        Write-Progress -Activity "Hashing Emails" -Completed
-        Write-Host "`nSuccess! Processed $totalLines lines." -ForegroundColor Green
-        Write-Host "Output file: $fullOutputPath" -ForegroundColor Gray
+        Write-Host "`nSuccess! Processed $totalRows rows (skipped lines without '$Delimiter')." -ForegroundColor Green
     } else {
-        Write-Error "The input file '$fullInputPath' could not be found."
+        Write-Error "File not found: $fullInputPath"
     }
 }
